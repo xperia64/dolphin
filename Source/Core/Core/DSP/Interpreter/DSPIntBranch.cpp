@@ -103,6 +103,18 @@ void Interpreter::ret(const UDSPInstruction opc)
 
   auto& state = m_dsp_core.DSPState();
   state.pc = state.PopStack(StackRegister::Call);
+
+  // Emulate errata: eat a loop if we are returning to the end of a loop
+  // Tested with BLOOPI, TODO verify other loop types
+  // TODO verify that the return is what messes with the loop counter and not the call
+  if (state.GetAnalyzer().IsLoopEnd(static_cast<u16>(state.pc)))
+  {
+    u16& rLoopCounter = state.r.st[3];
+    if (rLoopCounter > 0)
+    {
+      rLoopCounter--;
+    }
+  }
 }
 
 // RTIcc
