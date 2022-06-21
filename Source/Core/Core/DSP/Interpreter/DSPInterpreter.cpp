@@ -206,6 +206,8 @@ int Interpreter::RunCycles(int cycles)
     // Now, lets run some more without idle skipping.
     for (int i = 0; i < 200; i++)
     {
+      if ((state.control_reg & CR_HALT) != 0)
+        return 0;
       Step();
       cycles--;
       if (cycles <= 0)
@@ -239,7 +241,7 @@ void Interpreter::WriteControlRegister(u16 val)
   }
   // init - unclear if writing CR_INIT_CODE does something. Clearing CR_INIT immediately sets
   // CR_INIT_CODE, which gets unset a bit later...
-  if (((state.control_reg & CR_INIT) != 0) && ((val & CR_INIT) == 0))
+  if (((state.control_reg & CR_INIT) != 0) && ((val & CR_INIT) == 0) && (val & CR_HALT))
   {
     INFO_LOG_FMT(DSPLLE, "DSP_CONTROL INIT");
     // Copy 1024(?) bytes of uCode from main memory 0x81000000 (or is it ARAM 00000000?)

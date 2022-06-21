@@ -128,7 +128,7 @@ void Interpreter::halt(const UDSPInstruction)
 {
   auto& state = m_dsp_core.DSPState();
   state.control_reg |= CR_HALT;
-  state.pc--;
+  // state.pc--;
 }
 
 // LOOP handling: Loop stack is used to control execution of repeated blocks of

@@ -438,20 +438,22 @@ TryReadInstResult TryReadInstruction(u32 address)
 
   u32 hex;
   // TODO: Refactor this. This icache implementation is totally wrong if used with the fake vmem.
+  const u8 le_mask = MSR.LE ? 0b100 : 0b000;
   if (Memory::m_pFakeVMEM && ((address & 0xFE000000) == 0x7E000000))
   {
-    hex = Common::swap32(&Memory::m_pFakeVMEM[address & Memory::GetFakeVMemMask()]);
+    hex = Common::swap32(&Memory::m_pFakeVMEM[(address ^ le_mask) & Memory::GetFakeVMemMask()]);
   }
   else
   {
-    hex = PowerPC::ppcState.iCache.ReadInstruction(address);
+    hex = PowerPC::ppcState.iCache.ReadInstruction(address ^ le_mask);
   }
   return TryReadInstResult{true, from_bat, hex, address};
 }
 
 u32 HostRead_Instruction(const u32 address)
 {
-  return ReadFromHardware<XCheckTLBFlag::OpcodeNoException, u32>(address);
+  const u8 le_mask = MSR.LE ? 0b100 : 0b000;
+  return ReadFromHardware<XCheckTLBFlag::OpcodeNoException, u32>(address ^ le_mask);
 }
 
 std::optional<ReadResult<u32>> HostTryReadInstruction(const u32 address,
@@ -523,22 +525,25 @@ static void Memcheck(u32 address, u64 var, bool write, size_t size)
 
 u8 Read_U8(const u32 address)
 {
-  u8 var = ReadFromHardware<XCheckTLBFlag::Read, u8>(address);
-  Memcheck(address, var, false, 1);
+  const u8 le_mask = MSR.LE ? 0b111 : 0b000;
+  u8 var = ReadFromHardware<XCheckTLBFlag::Read, u8>(address ^ le_mask);
+  Memcheck(address ^ le_mask, var, false, 1);
   return var;
 }
 
 u16 Read_U16(const u32 address)
 {
-  u16 var = ReadFromHardware<XCheckTLBFlag::Read, u16>(address);
-  Memcheck(address, var, false, 2);
+  const u8 le_mask = MSR.LE ? 0b110 : 0b000;
+  u16 var = ReadFromHardware<XCheckTLBFlag::Read, u16>(address ^ le_mask);
+  Memcheck(address ^ le_mask, var, false, 2);
   return var;
 }
 
 u32 Read_U32(const u32 address)
 {
-  u32 var = ReadFromHardware<XCheckTLBFlag::Read, u32>(address);
-  Memcheck(address, var, false, 4);
+  const u8 le_mask = MSR.LE ? 0b100 : 0b000;
+  u32 var = ReadFromHardware<XCheckTLBFlag::Read, u32>(address ^ le_mask);
+  Memcheck(address ^ le_mask, var, false, 4);
   return var;
 }
 
@@ -642,14 +647,16 @@ u32 Read_U16_ZX(const u32 address)
 
 void Write_U8(const u32 var, const u32 address)
 {
-  Memcheck(address, var, true, 1);
-  WriteToHardware<XCheckTLBFlag::Write>(address, var, 1);
+  const u8 le_mask = MSR.LE ? 0b111 : 0b000;
+  Memcheck(address ^ le_mask, var, true, 1);
+  WriteToHardware<XCheckTLBFlag::Write>(address ^ le_mask, var, 1);
 }
 
 void Write_U16(const u32 var, const u32 address)
 {
-  Memcheck(address, var, true, 2);
-  WriteToHardware<XCheckTLBFlag::Write>(address, var, 2);
+  const u8 le_mask = MSR.LE ? 0b110 : 0b000;
+  Memcheck(address ^ le_mask, var, true, 2);
+  WriteToHardware<XCheckTLBFlag::Write>(address ^ le_mask, var, 2);
 }
 void Write_U16_Swap(const u32 var, const u32 address)
 {
@@ -658,8 +665,9 @@ void Write_U16_Swap(const u32 var, const u32 address)
 
 void Write_U32(const u32 var, const u32 address)
 {
-  Memcheck(address, var, true, 4);
-  WriteToHardware<XCheckTLBFlag::Write>(address, var, 4);
+  const u8 le_mask = MSR.LE ? 0b100 : 0b000;
+  Memcheck(address ^ le_mask, var, true, 4);
+  WriteToHardware<XCheckTLBFlag::Write>(address ^ le_mask, var, 4);
 }
 void Write_U32_Swap(const u32 var, const u32 address)
 {
