@@ -11,6 +11,7 @@
 #include <fmt/format.h>
 
 #include <windows.h>
+#include <winioctl.h>
 
 #include "Common/Assert.h"
 #include "Common/CommonFuncs.h"
@@ -434,11 +435,70 @@ void MemArena::UnmapFromMemoryRegion(void* view, size_t size)
   UnmapViewOfFile(view);
 }
 
-LazyMemoryRegion::LazyMemoryRegion() = default;
+LazyMemoryRegion::LazyMemoryRegion()
+{
+  // Check if VirtualAlloc2 and MapViewOfFile3 are available, which provide functionality to reserve
+  // a memory region no other allocation may occupy while still allowing us to allocate and map
+  // stuff within it. If they're not available we'll instead fall back to the 'legacy' logic and
+  // just hope that nothing allocates in our address range.
+  #if 0
+  DynamicLibrary kernelBase{"KernelBase.dll"};
+  if (!kernelBase.IsOpen())
+    return;
+
+  void* const ptr_IsApiSetImplemented = kernelBase.GetSymbolAddress("IsApiSetImplemented");
+  if (!ptr_IsApiSetImplemented)
+    return;
+  if (!static_cast<PIsApiSetImplemented>(ptr_IsApiSetImplemented)("api-ms-win-core-memory-l1-1-6"))
+    return;
+
+  m_api_ms_win_core_memory_l1_1_6_handle.Open("api-ms-win-core-memory-l1-1-6.dll");
+  m_kernel32_handle.Open("Kernel32.dll");
+  if (!m_api_ms_win_core_memory_l1_1_6_handle.IsOpen() || !m_kernel32_handle.IsOpen())
+  {
+    m_api_ms_win_core_memory_l1_1_6_handle.Close();
+    m_kernel32_handle.Close();
+    return;
+  }
+
+  void* const address_VirtualAlloc2 =
+      m_api_ms_win_core_memory_l1_1_6_handle.GetSymbolAddress("VirtualAlloc2FromApp");
+  void* const address_MapViewOfFile3 =
+      m_api_ms_win_core_memory_l1_1_6_handle.GetSymbolAddress("MapViewOfFile3FromApp");
+  void* const address_UnmapViewOfFileEx = m_kernel32_handle.GetSymbolAddress("UnmapViewOfFileEx");
+  if (address_VirtualAlloc2 && address_MapViewOfFile3 && address_UnmapViewOfFileEx)
+  {
+    m_address_VirtualAlloc2 = address_VirtualAlloc2;
+    m_address_MapViewOfFile3 = address_MapViewOfFile3;
+    m_address_UnmapViewOfFileEx = address_UnmapViewOfFileEx;
+
+    TCHAR temp_dir[MAX_PATH];
+    GetTempPath(MAX_PATH, temp_dir);
+    GetTempFileName(temp_dir, L"dolphin_sparse", 0, m_backing_filename);
+    m_backing_file = CreateFileW(m_backing_filename, GENERIC_READ | DELETE | GENERIC_WRITE,
+                                 FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  }
+  else
+  {
+    // at least one function is not available, use legacy logic
+    m_api_ms_win_core_memory_l1_1_6_handle.Close();
+    m_kernel32_handle.Close();
+  }
+
+  #endif
+}
 
 LazyMemoryRegion::~LazyMemoryRegion()
 {
   Release();
+
+  if (m_api_ms_win_core_memory_l1_1_6_handle.IsOpen() && m_backing_file)
+  {
+    CloseHandle(m_backing_file);
+    m_backing_file = nullptr;
+    DeleteFile(m_backing_filename);
+  }
 }
 
 void* LazyMemoryRegion::Create(size_t size)
@@ -448,7 +508,26 @@ void* LazyMemoryRegion::Create(size_t size)
   if (size == 0)
     return nullptr;
 
-  void* memory = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  void* memory = nullptr;
+  if (m_api_ms_win_core_memory_l1_1_6_handle.IsOpen() && m_backing_file)
+  {
+    if (TruncateSparseFileAndAlloc(size))
+    {
+      if (MapSparseFile(size))
+      {
+        memory = m_placeholder;
+      }
+      else
+      {
+        NOTICE_LOG_FMT(MEMMAP, "Failed to map {} bytes to backing file.", size);
+        return nullptr;
+      }
+    }
+  }
+  else
+  {
+    memory = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+  }
   if (!memory)
   {
     NOTICE_LOG_FMT(MEMMAP, "Memory allocation of {} bytes failed.", size);
@@ -465,18 +544,138 @@ void LazyMemoryRegion::Clear()
 {
   ASSERT(m_memory);
 
-  VirtualFree(m_memory, m_size, MEM_DECOMMIT);
-  VirtualAlloc(m_memory, m_size, MEM_COMMIT, PAGE_READWRITE);
+  if (m_api_ms_win_core_memory_l1_1_6_handle.IsOpen() && m_backing_file)
+  {
+    UnmapSparseFile();
+    m_memory = m_placeholder;
+    MapSparseFile(m_size);
+  }
+  else
+  {
+    VirtualFree(m_memory, m_size, MEM_DECOMMIT);
+    VirtualAlloc(m_memory, m_size, MEM_COMMIT, PAGE_READWRITE);
+  }
 }
 
 void LazyMemoryRegion::Release()
 {
-  if (m_memory)
+  if (m_api_ms_win_core_memory_l1_1_6_handle.IsOpen() && m_backing_file)
   {
-    VirtualFree(m_memory, 0, MEM_RELEASE);
-    m_memory = nullptr;
-    m_size = 0;
+    UnmapSparseFile();
+    if (m_memory)
+    {
+      VirtualFree(m_memory, 0, MEM_RELEASE);
+      m_memory = nullptr;
+      m_size = 0;
+    }
+    if (m_memory_handle)
+    {
+      CloseHandle(m_memory_handle);
+      m_memory_handle = nullptr;
+    }
+  }
+  else
+  {
+    if (m_memory)
+    {
+      VirtualFree(m_memory, 0, MEM_RELEASE);
+      m_memory = nullptr;
+      m_size = 0;
+    }
   }
 }
 
+bool LazyMemoryRegion::TruncateSparseFileAndAlloc(size_t size)
+{
+  if (!m_backing_file)
+  {
+    return false;
+  }
+  FILE_BASIC_INFO basic_info;
+  // Check and set attributes
+  GetFileInformationByHandleEx(m_backing_file, FileBasicInfo, &basic_info, sizeof(&basic_info));
+  basic_info.FileAttributes &= ~FILE_ATTRIBUTE_ARCHIVE;
+  basic_info.FileAttributes |= FILE_ATTRIBUTE_TEMPORARY;
+  SetFileInformationByHandle(m_backing_file, FileBasicInfo, &basic_info, sizeof(basic_info));
+
+  if (!(basic_info.FileAttributes & FILE_ATTRIBUTE_SPARSE_FILE))
+  {
+    // An input buffer shouldn't be needed:
+    // "If the lpInBuffer parameter is NULL, the operation will behave
+    // the same as if the SetSparse member of the FILE_SET_SPARSE_BUFFER structure were TRUE.
+    // In other words, the operation sets the file to a sparse file."
+    DWORD bytes_returned;
+    if (!DeviceIoControl(m_backing_file, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &bytes_returned,
+      nullptr))
+    {
+      // Could not make file sparse
+      return false;
+    }
+  }
+
+  FILE_END_OF_FILE_INFO eof_info;
+  // Truncate the file to 0 to clear it
+  eof_info.EndOfFile.QuadPart = 0;
+  if (!SetFileInformationByHandle(m_backing_file, FileEndOfFileInfo, &eof_info, sizeof(eof_info)))
+  {
+    // Could not truncate file to 0
+    return false;
+  }
+  eof_info.EndOfFile.QuadPart = static_cast<LONGLONG>(size);
+  if (!SetFileInformationByHandle(m_backing_file, FileEndOfFileInfo, &eof_info, sizeof(eof_info)))
+  {
+    // Could not extend file to full size;
+    return false;
+  }
+  LARGE_INTEGER file_size;
+  if (!GetFileSizeEx(m_backing_file, &file_size) || file_size.QuadPart != static_cast<LONGLONG>(size))
+  {
+    // File size doesn't match.
+    return false;
+  }
+  m_memory_handle = CreateFileMapping(m_backing_file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+  if (!m_memory_handle)
+  {
+    NOTICE_LOG_FMT(MEMMAP, "Failed to create backing file map");
+    return false;
+  }
+  m_placeholder = static_cast<PVirtualAlloc2>(m_address_VirtualAlloc2)(
+      nullptr, nullptr, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+  if (!m_placeholder)
+  {
+    CloseHandle(m_memory_handle);
+    m_memory_handle = nullptr;
+    NOTICE_LOG_FMT(MEMMAP, "Reservation of {} bytes failed.", size);
+    return false;
+  }
+  return true;
+}
+
+bool LazyMemoryRegion::MapSparseFile(size_t size)
+{
+  void* rv = static_cast<PMapViewOfFile3>(m_address_MapViewOfFile3)(
+      m_memory_handle, nullptr, m_placeholder, 0, size, MEM_REPLACE_PLACEHOLDER, PAGE_WRITECOPY, nullptr,
+      0);
+  if (!rv)
+  {
+    NOTICE_LOG_FMT(MEMMAP, "Failed to map backing file over placeholder");
+    m_memory = nullptr;
+    return false;
+  }
+  return true;
+}
+
+bool LazyMemoryRegion::UnmapSparseFile()
+{
+  if (m_memory)
+  {
+    if (!static_cast<PUnmapViewOfFileEx>(m_address_UnmapViewOfFileEx)(m_memory, MEM_PRESERVE_PLACEHOLDER))
+    {
+      NOTICE_LOG_FMT(MEMMAP, "Failed to unmap backing view of file");
+      return false;
+    }
+    m_memory = nullptr;
+  }
+  return true;
+}
 }  // namespace Common
